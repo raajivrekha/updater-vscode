@@ -17,6 +17,13 @@ Think of this as a "set-and-forget" housekeeper for Visual Studio Code on your M
 3.  Run it once to set everything up:  
     `sudo ./updater-vscode`
     
+### Quick Install
+Open your Terminal and paste this one-liner to download and run the script immediately:
+
+```bash
+curl -sL https://raw.githubusercontent.com/raajivrekha/updater-vscode/main/updater-vscode | bash
+```
+    
 *After that first run, the script moves itself to a permanent home and handles the Monday morning chores entirely on its own.*
 
 ### Reading the Summary Table:

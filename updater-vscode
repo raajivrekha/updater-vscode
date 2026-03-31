@@ -3,16 +3,27 @@
 # TITLE:       updater-vscode
 # DESCRIPTION: A script that manages VS Code updates and settings. Every Monday
 #              at 09:00 AM, it checks for new versions, verifies the download
-#              SHA-256, and merges 132 settings into all macOS user profiles
-#              while leaving personal themes and extensions alone.
+#              SHA-256, and merges 132 settings into all macOS user profiles.
+# LOG FILE:    /var/log/updater-vscode.log
 # AUTHOR:      Raajiv Rekha
-# VERSION:     1.0 (GM)
-# STAMP:       20260330-190000
+# VERSION:     1.2
+# STAMP:       20260331-101500
 # ------------------------------------------------------------------------------
 
+readonly LOG_FILE="/var/log/updater-vscode.log"
+
+# Dual-Stream Logging: Prints to Terminal AND Appends to Log File
 log_audit() {
-  local ts=$(date '+%H:%M:%S.000')
-  printf "[%s] AUDIT | %s\n" "$ts" "$1"
+  local ts=$(date '+%Y-%m-%d %H:%M:%S')
+  local msg="[$ts] AUDIT | $1"
+
+  # Print to current terminal session
+  echo "$msg"
+
+  # Append to system log if running as root (manual sudo or launchd)
+  if [[ $EUID -eq 0 ]]; then
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null
+  fi
 }
 
 # --- Operational Configuration ---
@@ -21,6 +32,8 @@ readonly LABEL="com.updater-vscode"
 readonly PLIST_PATH="/Library/LaunchDaemons/${LABEL}.plist"
 readonly SCRIPT_PATH="/usr/local/bin/updater-vscode"
 readonly CACHE_LIMIT=3
+# Browser User-Agent to prevent Microsoft API from blocking "bot" requests
+readonly UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
 # --- System and Path Constants ---
 readonly APP_NAME="Visual Studio Code"
@@ -28,7 +41,6 @@ readonly APP_TARGET="/Applications/${APP_NAME}.app"
 readonly BIN_LINK="/usr/local/bin/code"
 readonly CACHE_ROOT="/Users/Shared/CachedInstallers/VSCode"
 
-# Architecture Detection
 ARCH_LABEL=$(uname -m)
 [[ "$ARCH_LABEL" == "arm64" ]] && API_URL="https://update.code.visualstudio.com/api/update/darwin-arm64/stable/latest" || API_URL="https://update.code.visualstudio.com/api/update/darwin-universal/stable/latest"
 
@@ -36,7 +48,7 @@ readonly DEPLOY_WORKSPACE=$(mktemp -d -t "vscode_updater_XXXXXX")
 readonly EXTRACT_DIR="${DEPLOY_WORKSPACE}/extract"
 readonly BASELINE_JSON="${CACHE_ROOT}/baseline.json"
 
-# --- 1. LaunchDaemon Blueprint (The Automatic Checker) ---
+# --- 1. Persistence Blueprint (LaunchDaemon) ---
 readonly PLIST_CONTENT="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\">
@@ -59,13 +71,13 @@ readonly PLIST_CONTENT="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
         <integer>1</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>/var/log/updater-vscode.log</string>
+    <string>${LOG_FILE}</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/updater-vscode.log</string>
+    <string>${LOG_FILE}</string>
 </dict>
 </plist>"
 
-# --- 2. Golden Standard Configuration (132 Leaf Settings) ---
+# --- 2. Golden Standard Configuration (132 Settings) ---
 readonly STD_SETTINGS='{
   "workbench.settings.editor": "json",
   "window.titleBarStyle": "native",
@@ -209,13 +221,20 @@ readonly STD_SETTINGS='{
   "inlineChat.renderMode": "hover"
 }'
 
-# --- 3. Elevation & Persistence Engine ---
+# --- 3. Elevation & Self-Sync ---
 if [[ $EUID -ne 0 ]]; then
     log_audit "ELEVATION: Administrative privileges required. Re-executing as root."
     exec sudo "$0" "$@"
     exit $?
 fi
 
+# Create log file if missing
+if [[ ! -f "$LOG_FILE" ]]; then
+    touch "$LOG_FILE"
+    chmod 644 "$LOG_FILE"
+fi
+
+# Install script to /usr/local/bin if needed
 if [[ "$(realpath "$0")" != "$SCRIPT_PATH" ]]; then
     log_audit "ACTION: Installing script to $SCRIPT_PATH"
     mkdir -p "$(dirname "$SCRIPT_PATH")"
@@ -224,6 +243,7 @@ if [[ "$(realpath "$0")" != "$SCRIPT_PATH" ]]; then
     chown root:wheel "$SCRIPT_PATH"
 fi
 
+# Sync LaunchDaemon schedule
 PROPOSED_PLIST_HASH=$(echo "$PLIST_CONTENT" | shasum -a 256 | awk '{print $1}')
 CURRENT_PLIST_HASH=$(shasum -a 256 "$PLIST_PATH" 2>/dev/null | awk '{print $1}')
 if [[ "$PROPOSED_PLIST_HASH" != "$CURRENT_PLIST_HASH" ]]; then
@@ -238,51 +258,58 @@ fi
 trap 'rm -rf "${DEPLOY_WORKSPACE}"; log_audit "CLEANUP: Secure staging workspace purged."' EXIT
 
 log_audit "-------------------------------------------------------------------------------"
-log_audit "STARTING DEPLOYMENT: updater-vscode v1.0 | STAMP: 20260330-190000"
+log_audit "STARTING DEPLOYMENT: updater-vscode v1.2 | STAMP: 20260331-101500"
 log_audit "-------------------------------------------------------------------------------"
 
-# --- 4. Manifest Resolution ---
-RELEASE_JSON=$(curl -sL "$API_URL")
-REMOTE_VER=$(echo "$RELEASE_JSON" | jq -r '.name' 2>/dev/null)
-EXPECTED_HASH=$(echo "$RELEASE_JSON" | jq -r '.sha256hash' 2>/dev/null)
-DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.url' 2>/dev/null)
-REMOTE_FILENAME=$(basename "$DOWNLOAD_URL")
+# --- 4. API Manifest Resolution ---
+log_audit "ACTION: Resolving remote version from Microsoft API..."
+RELEASE_JSON=$(curl -sL -A "$UA" "$API_URL")
 
-readonly VERSION_CACHE_DIR="${CACHE_ROOT}/${REMOTE_VER}/${ARCH_LABEL}"
-readonly LOCAL_ASSET_PATH="${VERSION_CACHE_DIR}/${REMOTE_FILENAME}"
+REMOTE_VER=$(echo "$RELEASE_JSON" | jq -r '.name // empty')
+EXPECTED_HASH=$(echo "$RELEASE_JSON" | jq -r '.sha256hash // empty')
+DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.url // empty')
 
-# --- 5. Vault Audit ---
-mkdir -p "$VERSION_CACHE_DIR"
-chmod 755 /Users/Shared/CachedInstallers "$CACHE_ROOT" "${CACHE_ROOT}/${REMOTE_VER}" "$VERSION_CACHE_DIR"
-
-if [[ ! -f "$LOCAL_ASSET_PATH" ]]; then
-    log_audit "ACTION: Cache miss. Downloading v$REMOTE_VER..."
-    curl -L -f -sS -o "$LOCAL_ASSET_PATH" "$DOWNLOAD_URL"
-    chmod 644 "$LOCAL_ASSET_PATH"
-    LOCAL_HASH=$(shasum -a 256 "$LOCAL_ASSET_PATH" | awk '{print $1}')
-    [[ "$LOCAL_HASH" != "$EXPECTED_HASH" ]] && { log_audit "FAILURE: SHA-256 handshake failed."; exit 1; }
-    log_audit "SUCCESS: v$REMOTE_VER vaulted and verified."
+if [[ -z "$REMOTE_VER" || -z "$DOWNLOAD_URL" ]]; then
+    log_audit "WARNING: Microsoft API returned empty manifest. Skipping binary update."
 else
-    log_audit "SKIP: Vault integrity confirmed for v$REMOTE_VER ($ARCH_LABEL)."
-fi
+    REMOTE_FILENAME=$(basename "$DOWNLOAD_URL")
+    readonly VERSION_CACHE_DIR="${CACHE_ROOT}/${REMOTE_VER}/${ARCH_LABEL}"
+    readonly LOCAL_ASSET_PATH="${VERSION_CACHE_DIR}/${REMOTE_FILENAME}"
 
-# --- 6. Binary Synchronization ---
-[[ -d "$APP_TARGET" ]] && LOCAL_APP_VER=$(defaults read "${APP_TARGET}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null) || LOCAL_APP_VER="absent"
+    # --- 5. Vault Audit ---
+    mkdir -p "$VERSION_CACHE_DIR"
+    chmod 755 /Users/Shared/CachedInstallers "$CACHE_ROOT" "${CACHE_ROOT}/${REMOTE_VER}" "$VERSION_CACHE_DIR"
 
-if [[ "$LOCAL_APP_VER" != "$REMOTE_VER" ]]; then
-    log_audit "ACTION: Version drift (Installed: $LOCAL_APP_VER, Target: $REMOTE_VER)."
-    if pgrep -f "$APP_NAME" > /dev/null; then
-        pkill -SIGTERM -f "$APP_NAME"; sleep 2; pgrep -f "$APP_NAME" > /dev/null && pkill -SIGKILL -f "$APP_NAME"
+    if [[ ! -f "$LOCAL_ASSET_PATH" ]]; then
+        log_audit "ACTION: Cache miss. Downloading v$REMOTE_VER..."
+        curl -L -f -sS -A "$UA" -o "$LOCAL_ASSET_PATH" "$DOWNLOAD_URL"
+        chmod 644 "$LOCAL_ASSET_PATH"
+        LOCAL_HASH=$(shasum -a 256 "$LOCAL_ASSET_PATH" | awk '{print $1}')
+        [[ "$LOCAL_HASH" != "$EXPECTED_HASH" ]] && { log_audit "FAILURE: SHA-256 handshake failed."; exit 1; }
+        log_audit "SUCCESS: v$REMOTE_VER vaulted and verified."
+    else
+        log_audit "SKIP: Vault integrity confirmed for v$REMOTE_VER ($ARCH_LABEL)."
     fi
-    mkdir -p "${EXTRACT_DIR}"
-    if unzip -q -o "$LOCAL_ASSET_PATH" -d "${EXTRACT_DIR}"; then
-        rm -rf "$APP_TARGET"; mv "${EXTRACT_DIR}/Visual Studio Code.app" "/Applications/"
-        xattr -rd com.apple.quarantine "$APP_TARGET" 2>/dev/null
-        ln -sf "$APP_TARGET/Contents/Resources/app/bin/code" "$BIN_LINK"
-        CHANGES_DETECTED=true; log_audit "SUCCESS: Binary updated to v$REMOTE_VER."
+
+    # --- 6. Binary Synchronization ---
+    [[ -d "$APP_TARGET" ]] && LOCAL_APP_VER=$(defaults read "${APP_TARGET}/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null) || LOCAL_APP_VER="absent"
+
+    if [[ "$LOCAL_APP_VER" != "$REMOTE_VER" ]]; then
+        log_audit "ACTION: Version drift (Installed: $LOCAL_APP_VER, Target: $REMOTE_VER)."
+        if pgrep -f "$APP_NAME" > /dev/null; then
+            pkill -SIGTERM -f "$APP_NAME"; sleep 2; pgrep -f "$APP_NAME" > /dev/null && pkill -SIGKILL -f "$APP_NAME"
+        fi
+        mkdir -p "${EXTRACT_DIR}"
+        if unzip -q -o "$LOCAL_ASSET_PATH" -d "${EXTRACT_DIR}"; then
+            rm -rf "$APP_TARGET"
+            mv "${EXTRACT_DIR}/Visual Studio Code.app" "/Applications/"
+            xattr -rd com.apple.quarantine "$APP_TARGET" 2>/dev/null
+            ln -sf "$APP_TARGET/Contents/Resources/app/bin/code" "$BIN_LINK"
+            CHANGES_DETECTED=true; log_audit "SUCCESS: Binary updated to v$REMOTE_VER."
+        fi
+    else
+        log_audit "SKIP: Binary v$LOCAL_APP_VER is current."
     fi
-else
-    log_audit "SKIP: Binary v$LOCAL_APP_VER is current."
 fi
 
 # --- 7. Forensic Profile Enforcement ---
@@ -305,7 +332,7 @@ while IFS= read -r user; do
         u_file="${home}/Library/Application Support/Code/User/settings.json"
         mkdir -p "$(dirname "$u_file")"
 
-        # Null-Safe Protection
+        # Null-Safe Check
         if [[ ! -f "$u_file" ]] || ! jq -e . "$u_file" >/dev/null 2>&1; then
             log_audit "ACTION: Repairing JSON structure for [$user]..."
             echo "{}" > "$u_file"
@@ -313,6 +340,7 @@ while IFS= read -r user; do
         fi
 
         CURRENT_JSON=$(cat "$u_file")
+        # Ensure merge handles empty/null files correctly
         PROPOSED_JSON=$(sudo -u "$user" jq -s 'if .[0] == null then {} else .[0] end * .[1]' "$u_file" "$BASELINE_JSON")
 
         DRIFT_KEYS=$(sudo -u "$user" jq -r --argjson gold "$STD_SETTINGS" 'if type=="object" then (keys - ($gold | keys) | .[]) else empty end' "$u_file" 2>/dev/null)
